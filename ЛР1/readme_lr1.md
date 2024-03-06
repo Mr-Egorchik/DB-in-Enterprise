@@ -83,4 +83,110 @@ WHERE "id" IN (
     )
 );
 ```
-2. 
+2. Получить жанр приложений, в которые было выполнено больше всего входов за все время, и количество этих приложений
+```sql
+SELECT genre, COUNT(DISTINCT app.id)
+FROM app
+JOIN "session" ON app.id = "session".app_id
+GROUP BY app.genre
+HAVING COUNT(*) = (
+    SELECT MAX(Counted)
+    FROM (
+        SELECT COUNT(*) AS Counted
+        FROM app
+        JOIN "session" ON app.id = "session".app_id
+        GROUP BY app.genre
+    ) AS SubQuery
+);
+```
+3. Получить электронную почту пользователя(-ей), который оставил наибольшее количество негативных отзывов (stars = 1) приложениям жанра с наилучшим средним рейтингом
+```sql
+SELECT email FROM profile WHERE user_id in (SELECT user_id
+FROM (
+    SELECT user_id, COUNT(stars) AS Counted_Stars
+    FROM "comment" 
+    JOIN app ON "comment".app_id = app.id 
+    WHERE stars = 1 AND genre = (
+        SELECT genre FROM "comment" 
+        JOIN app ON "comment".app_id = app.id 
+        GROUP BY genre 
+        HAVING AVG(stars) = (
+            SELECT MAX(mean) FROM (
+                SELECT genre, AVG(stars) AS mean 
+                FROM "comment" 
+                JOIN app ON "comment".app_id = app.id 
+                GROUP BY genre
+            ) AS SubQuery
+        )
+    ) 
+    GROUP BY "comment".user_id
+) AS SubQuery2
+WHERE Counted_Stars = (
+    SELECT MAX(Counted_Stars) FROM (
+        SELECT user_id, COUNT(stars) AS Counted_Stars
+        FROM "comment" 
+        JOIN app ON "comment".app_id = app.id 
+        WHERE stars = 1 AND genre = (
+            SELECT genre FROM "comment" 
+            JOIN app ON "comment".app_id = app.id 
+            GROUP BY genre 
+            HAVING AVG(stars) = (
+                SELECT MAX(mean) FROM (
+                    SELECT genre, AVG(stars) AS mean 
+                    FROM "comment" 
+                    JOIN app ON "comment".app_id = app.id 
+                    GROUP BY genre
+                ) AS SubQuery
+            )
+        ) 
+        GROUP BY "comment".user_id
+    ) AS SubQuery3
+)
+);
+```
+4. Получить средний рейтинг каждой группы приложений по жанру, учитывая только те приложения, у которых поличество пользователей ниже среднего и в который был выполнен вход в течение последней недели
+```sql
+SELECT genre, AVG(stars)
+FROM app
+JOIN "comment" ON app.id = "comment".app_id
+WHERE app.id IN (
+	SELECT app_id
+	FROM app_user
+	WHERE app_id IN (
+		SELECT app_id
+		FROM "session"
+		WHERE start_date BETWEEN CURRENT_DATE - INTERVAL '1 week' AND CURRENT_DATE
+	)
+	GROUP BY app_id
+	HAVING COUNT(user_id) < (
+		SELECT AVG(Counted)
+		FROM (
+			SELECT app_id, COUNT(user_id) AS Counted
+			FROM app_user
+			GROUP BY app_id
+		)
+		AS SubQuery
+	)
+)
+GROUP BY genre;
+```
+5. Получить название приложения(-ий), у которого(-ых) суммарное время всех сессий максимально
+```sql
+SELECT title
+FROM app
+WHERE "id" IN (
+	SELECT app_id
+	FROM (
+		SELECT app_id, SUM(EXTRACT(EPOCH FROM (end_date - start_date)) / 3600) AS time_in_app
+		FROM "session"
+		GROUP BY app_id
+	) AS SubQuery
+	WHERE time_in_app = (
+		SELECT MAX(time_in_app) FROM (
+			SELECT app_id, SUM(EXTRACT(EPOCH FROM (end_date - start_date)) / 3600) AS time_in_app
+			FROM "session"
+			GROUP BY app_id
+		) AS MaxSubQuery
+	)
+);
+```
