@@ -265,3 +265,134 @@ for profile in profiles:
 |Ускорение|2.54|1.91|2.03|1.54|1.09|
 
 Т.е., в среднем в 2 раза время выполнение запросов усменьшилось, довольно приятный результат.
+
+Наконец, далее я перешел к изменению самих запросов. Далее будут описаны стратегии изменения запросов и итоговые SQL-скрипты этих запросов.
+
+- Запрос 1. Здесь я решил попробовать сделать поменьше вложенных запросов, использовав join. Получился вот такой запрос:
+```sql
+WITH AvgCount AS (
+    SELECT AVG(Counted) AS AvgCount
+    FROM (
+        SELECT user_id, COUNT(*) AS Counted
+        FROM app_user
+        GROUP BY user_id
+    ) AS SubQuery
+)
+SELECT u.username, u.pwd
+FROM "user" u
+JOIN app_user au ON u.id = au.user_id
+GROUP BY u.id
+HAVING COUNT(*) > (SELECT AvgCount FROM AvgCount);
+```
+Однако, время работы такого запроса составило 244 мс, что хуже изначального варианта.
+- Запрос 2. Запрос подразумевает поиск объекта с максимальной характеристикой, так что столь длинный запрос можно сильно упростить, если использовать DENSE_RANK и ORDER BY.
+```sql
+SELECT genre, app_count
+FROM (
+    SELECT 
+        genre, 
+        COUNT(DISTINCT app.id) AS app_count,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT app.id) DESC) as rank
+    FROM 
+        app 
+    JOIN 
+        "session" ON app.id = "session".app_id 
+    GROUP BY 
+        app.genre
+) AS ranked_genres
+WHERE rank = 1;
+```
+Время выполнения такого запроса составило 4691 мс, что на целую секунду меньше, чем предыдущий лучший результат.
+- Запрос 3. В этом запросе похожая идея, только с использованием ROWNUMB
+```sql
+SELECT email FROM profile WHERE user_id in (WITH RankedComments AS (
+    SELECT user_id, COUNT(stars) AS Counted_Stars,
+           ROW_NUMBER() OVER (ORDER BY COUNT(stars) DESC) AS Rank
+    FROM "comment" 
+    JOIN app ON "comment".app_id = app.id 
+    WHERE stars = 1 AND genre = (
+        SELECT genre FROM "comment" 
+        JOIN app ON "comment".app_id = app.id 
+        GROUP BY genre 
+        HAVING AVG(stars) = (
+            SELECT MAX(mean) FROM (
+                SELECT genre, AVG(stars) AS mean 
+                FROM "comment" 
+                JOIN app ON "comment".app_id = app.id 
+                GROUP BY genre
+            ) AS SubQuery
+        )
+    ) 
+    GROUP BY "comment".user_id
+)
+SELECT user_id
+FROM RankedComments
+WHERE Rank = 1
+);
+```
+Использование сего прекрасного оператора уменьшило время выполнения запроса до 353 мс, т.е. еще в 2 раза.
+- Запрос 4. Здесь же, чтобы исбавиться от дублирования одних и тех же запросов, было использовано CTE. Создание временных таблиц позволяет не выполнять постоянно один и тот же запрос, а просто вычленять из него необходимые данные.
+```sql
+WITH UserCounts AS (
+    SELECT app_id, COUNT(user_id) AS user_count
+    FROM app_user
+    GROUP BY app_id
+),
+AvgUserCount AS (
+    SELECT AVG(user_count) AS avg_user_count
+    FROM UserCounts
+),
+SessionApps AS (
+    SELECT app_id
+    FROM "session"
+    WHERE start_date BETWEEN CURRENT_DATE - INTERVAL '1 week' AND CURRENT_DATE
+),
+FilteredApps AS (
+    SELECT app_id
+    FROM UserCounts
+    WHERE user_count < (SELECT avg_user_count FROM AvgUserCount)
+    INTERSECT
+    SELECT app_id FROM SessionApps
+)
+SELECT genre, AVG(stars)
+FROM app
+JOIN "comment" ON app.id = "comment".app_id
+WHERE app.id IN (SELECT app_id FROM FilteredApps)
+GROUP BY genre;
+```
+Время выполнения запроса уменьшилось до 154 мс.
+- Запрос 5. Последний запрос также был переработан с применением CTE.
+```sql
+WITH session_summary AS (
+    SELECT
+        app_id,
+        SUM(EXTRACT(EPOCH FROM (end_date - start_date)) / 3600) AS time_in_app
+    FROM
+        "session"
+    GROUP BY
+        app_id
+),
+max_time_in_app AS (
+    SELECT
+        MAX(time_in_app) AS max_time
+    FROM
+        session_summary
+)
+SELECT
+    title
+FROM
+    app
+JOIN
+    session_summary ON app.id = session_summary.app_id
+JOIN
+    max_time_in_app ON session_summary.time_in_app = max_time_in_app.max_time;
+```
+Время выполнения запроса составило 1314 мс.
+
+Таким образом итоговое ускорение запросов составило:
+
+||Запрос 1|Запрос 2|Запрос 3|Запрос 4|Запрос 5|
+|-----------|--------|--------|--------|--------|--------|
+|Ускорение|2.54|2.27|4.02|2.18|1.28|
+
+Очень интересные результаты. Скорее всего, последний запрос в целом составлен так, что как его ни реализуй, ему ускориться особо некуда, тогда как запрос 3 изначально был сделан крайне неэффективно, и изменение структуры запроса сразу дало двукратное ускорение (к тому же, при конфигурации сервера мы увеличили work_mem, важный при выполнении оператора ORDER BY). Ну и самый прожорливый запрос удалось достаточно неплохо ускорить, более чем в 2 раза.
